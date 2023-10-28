@@ -1,0 +1,164 @@
+# coding: utf-8
+# 2021/4/23 @ tongshiwei
+
+import logging
+import numpy as np
+import torch
+from EduCDM import CDM
+from torch import nn
+import torch.nn.functional as F
+from tqdm import tqdm
+from ..irt import irt3pl
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+
+class NoneNegClipper(object):
+    def __init__(self):
+        super(NoneNegClipper, self).__init__()
+
+    def __call__(self, module):
+        if hasattr(module, 'weight'):
+            w = module.weight.data
+            #print(w)
+            a = torch.relu(torch.neg(w))
+            w.add_(a)
+
+class IRTNet(nn.Module):
+    def __init__(self, user_num, item_num, value_range, a_range, irf_kwargs=None):
+        super(IRTNet, self).__init__()
+        self.user_num = user_num
+        self.item_num = item_num
+        self.irf_kwargs = irf_kwargs if irf_kwargs is not None else {}
+        self.theta = nn.Embedding(self.user_num, 1)
+        self.a = nn.Embedding(self.item_num, 1)
+        self.b = nn.Embedding(self.item_num, 1)
+        self.c = nn.Embedding(self.item_num, 1)
+        self.value_range = value_range
+        self.a_range = a_range
+        self.out = nn.Linear(1,1)
+
+        for m in self.modules():
+            #print(m)
+            if isinstance(m, nn.Embedding):
+                nn.init.xavier_uniform_(m.weight)
+
+    def forward(self, user, item, diff):
+        theta = torch.squeeze(self.theta(user), dim=-1)
+        a = torch.squeeze(self.a(item), dim=-1)
+        b = torch.squeeze(self.b(item), dim=-1)
+        c = torch.squeeze(self.c(item), dim=-1)
+        c = torch.sigmoid(c)
+        if self.value_range is not None:
+            theta = self.value_range * (torch.sigmoid(theta) - 0.5)
+            b = self.value_range * (torch.sigmoid(b) - 0.5)
+        if self.a_range is not None:
+            a = self.a_range * torch.sigmoid(a)
+        else:
+            a = F.softplus(a)
+        if torch.max(theta != theta) or torch.max(a != a) or torch.max(b != b):  # pragma: no cover
+            raise ValueError('ValueError:theta,a,b may contains nan!  The value_range or a_range is too large.')
+        scores = self.irf(theta, a, b, c, **self.irf_kwargs)
+        #_scores = nn.ELU()(scores) + 1
+        scores_with_diff = torch.mul(scores.unsqueeze(1), diff.unsqueeze(1))
+        out = self.out(scores_with_diff)
+        #print(self.out.state_dict())
+        out = torch.squeeze(torch.sigmoid(out), dim=-1)
+        return out
+
+    @classmethod
+    def irf(cls, theta, a, b, c, **kwargs):
+        return irt3pl(theta, a, b, c, F=torch, **kwargs)
+
+    def apply_clipper(self):
+        clipper = NoneNegClipper()
+        self.a.apply(clipper)
+
+
+class IRT(CDM):
+    def __init__(self, user_num, item_num, value_range=None, a_range=None):
+        super(IRT, self).__init__()
+        self.irt_net = IRTNet(user_num, item_num, value_range, a_range)
+
+    def train(self, train_data, test_data=None, *, epoch: int, device="cpu", lr=0.001) -> ...:
+        self.irt_net = self.irt_net.to(device)
+        loss_function = nn.BCELoss()
+
+
+
+        for e in range(epoch):
+            trainer = torch.optim.Adam(self.irt_net.parameters(), lr,weight_decay=0.0001)
+            losses = []
+            for batch_data in tqdm(train_data, "Epoch %s" % e):
+                user_id, item_id, response, diff = batch_data
+                user_id: torch.Tensor = user_id.to(device)
+                item_id: torch.Tensor = item_id.to(device)
+                diff: torch.Tensor = diff.to(device)
+                predicted_response: torch.Tensor = self.irt_net(user_id, item_id, diff)
+                response: torch.Tensor = response.to(device)
+                loss = loss_function(predicted_response, response)
+
+                # back propagation
+                trainer.zero_grad()
+                loss.backward()
+                trainer.step()
+
+                self.irt_net.apply_clipper()
+
+                losses.append(loss.mean().item())
+
+            print("[Epoch %d] LogisticLoss: %.6f" % (e, float(np.mean(losses))))
+
+            if test_data is not None:
+                accuracy, precision, rmse, recall, auc, f1 = self.eval(test_data, device=device)
+                print("[Epoch %d] auc: %.6f, accuracy: %.6f" % (e, auc, accuracy))
+                print('epoch= %d, accuracy= %f, precision=%f, rmse= %f, recall= %f, auc= %f, f1= %f' % (
+                e, accuracy, precision, rmse, recall, auc, f1))
+
+    def eval(self, test_data, device="cpu") -> tuple:
+        self.irt_net = self.irt_net.to(device)
+        self.irt_net.eval()
+        y_pred = []
+        y_true = []
+        pred_class_all = []
+        for batch_data in tqdm(test_data, "evaluating"):
+            user_id, item_id, response, diff = batch_data
+            user_id: torch.Tensor = user_id.to(device)
+            item_id: torch.Tensor = item_id.to(device)
+            diff: torch.Tensor = diff.to(device)
+            pred: torch.Tensor = self.irt_net(user_id, item_id, diff)
+            y_pred.extend(pred.tolist())
+            y_true.extend(response.tolist())
+
+            batch_pred_class = []
+            batch_ys = response
+            batch_pred = pred
+            for i in range(len(batch_ys)):
+                if batch_pred[i] >= 0.5:
+                    batch_pred_class.append(1)
+                else:
+                    batch_pred_class.append(0)
+            pred_class_all += batch_pred_class
+
+        y_pred = np.array(y_pred)
+        y_true = np.array(y_true)
+        pred_class_all = np.array(pred_class_all)
+        accuracy = accuracy_score(y_true, pred_class_all)
+        precision = precision_score(y_true, pred_class_all)
+        recall = recall_score(y_true, pred_class_all)
+        f1 = f1_score(y_true, pred_class_all)
+
+            # compute RMSE
+        rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+            # compute AUC
+        auc = roc_auc_score(y_true, y_pred)
+
+        self.irt_net.train()
+
+        return accuracy, precision, rmse, recall, auc, f1
+
+    def save(self, filepath):
+        torch.save(self.irt_net.state_dict(), filepath)
+        logging.info("save parameters to %s" % filepath)
+
+    def load(self, filepath):
+        self.irt_net.load_state_dict(torch.load(filepath))
+        logging.info("load parameters from %s" % filepath)
