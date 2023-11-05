@@ -99,6 +99,8 @@ class NCDM(CDM):
             for batch_data in tqdm(train_data, "Epoch %s" % epoch_i):
                 batch_count += 1
                 user_id, item_id, knowledge_emb, y, diff = batch_data
+                mean_diff = torch.mean(diff)
+                diff = mean_diff.expand(diff.size())
                 user_id: torch.Tensor = user_id.to(device)
                 item_id: torch.Tensor = item_id.to(device)
                 knowledge_emb: torch.Tensor = knowledge_emb.to(device)
