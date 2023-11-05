@@ -125,6 +125,8 @@ class KaNCD(CDM):
             for batch_data in tqdm(train_set, "Epoch %s" % epoch_i):
                 batch_count += 1
                 user_info, item_info, knowledge_emb, y,diff = batch_data
+                mean_diff = torch.mean(diff)
+                diff = mean_diff.expand(diff.size())
                 user_info: torch.Tensor = user_info.to(device)
                 item_info: torch.Tensor = item_info.to(device)
                 knowledge_emb: torch.Tensor = knowledge_emb.to(device)
