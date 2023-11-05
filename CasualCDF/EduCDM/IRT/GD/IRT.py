@@ -89,6 +89,8 @@ class IRT(CDM):
             losses = []
             for batch_data in tqdm(train_data, "Epoch %s" % e):
                 user_id, item_id, response, diff = batch_data
+                mean_diff = torch.mean(diff)
+                diff = mean_diff.expand(diff.size())
                 user_id: torch.Tensor = user_id.to(device)
                 item_id: torch.Tensor = item_id.to(device)
                 diff: torch.Tensor = diff.to(device)
